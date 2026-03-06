@@ -1,0 +1,5 @@
+.secret.key
+config.dat
+config.json
+__pycache__/
+*.pyc
