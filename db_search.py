@@ -3,14 +3,27 @@ from tkinter import ttk, messagebox
 import threading
 import json
 import os
+import re
+import sys
 import time
 from cryptography.fernet import Fernet
 
-VERSION = '1.0.0'
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VERSION = '1.1.0'
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.path.join(BASE_DIR, '.secret.key')
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.dat')
 OLD_CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+
+
+def resource_path(name):
+    if getattr(sys, 'frozen', False):
+        bundled = os.path.join(getattr(sys, '_MEIPASS', BASE_DIR), name)
+        if os.path.exists(bundled):
+            return bundled
+    return os.path.join(BASE_DIR, name)
 
 
 # ── 암호화 ──────────────────────────────────────────────
@@ -41,46 +54,177 @@ DEFAULT_CONFIG = {
     'databases': [
         {
             'label': '[MSSQL] MyDatabase',
+            'comment': '',
             'type': 'mssql',
             'host': 'localhost',
             'port': 1433,
             'database': 'MyDatabase',
+            'auth': 'windows',
             'user': '',
             'password': '',
+            'oracle_sid': False,
         },
         {
             'label': '[PG] MyDatabase',
+            'comment': '',
             'type': 'postgresql',
             'host': 'localhost',
             'port': 5432,
             'database': 'mydb',
+            'auth': 'userpass',
             'user': 'postgres',
             'password': '',
+            'oracle_sid': False,
         },
     ]
 }
+
+
+def normalize_config(cfg):
+    defaults = {
+        'label': '',
+        'comment': '',
+        'type': 'mssql',
+        'host': '',
+        'port': 1433,
+        'database': '',
+        'auth': 'userpass',
+        'user': '',
+        'password': '',
+        'oracle_sid': False,
+    }
+    cfg.setdefault('databases', [])
+    for db in cfg['databases']:
+        old_has_auth = 'auth' in db
+        for key, val in defaults.items():
+            db.setdefault(key, val)
+        try:
+            db['port'] = int(db.get('port') or 0)
+        except (TypeError, ValueError):
+            db['port'] = 0
+        db['oracle_sid'] = bool(db.get('oracle_sid'))
+        if not old_has_auth:
+            if db.get('type') == 'mssql' and not db.get('user'):
+                db['auth'] = 'windows'
+            else:
+                db['auth'] = 'userpass'
+    return cfg
 
 
 def load_config():
     # 기존 config.json이 있으면 암호화로 마이그레이션
     if os.path.exists(OLD_CONFIG_FILE):
         with open(OLD_CONFIG_FILE, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
+            cfg = normalize_config(json.load(f))
         save_config(cfg)
         os.remove(OLD_CONFIG_FILE)
-        return cfg
+        return normalize_config(cfg)
 
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'rb') as f:
-            return _decrypt(f.read())
+            return normalize_config(_decrypt(f.read()))
 
     save_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG
+    return normalize_config(DEFAULT_CONFIG)
 
 
 def save_config(cfg):
     with open(CONFIG_FILE, 'wb') as f:
         f.write(_encrypt(cfg))
+
+
+# ── JDBC URL ──────────────────────────────────────────────
+
+DEFAULT_PORTS = {
+    'mssql': 1433,
+    'postgresql': 5432,
+    'oracle': 1521,
+}
+
+
+def build_jdbc_url(db: dict) -> str:
+    db_type = db.get('type', 'mssql')
+    host = db.get('host', '')
+    port = db.get('port') or DEFAULT_PORTS.get(db_type, 0)
+    database = db.get('database', '')
+    if db_type == 'postgresql':
+        return f'jdbc:postgresql://{host}:{port}/{database}'
+    if db_type == 'oracle':
+        if db.get('oracle_sid'):
+            return f'jdbc:oracle:thin:@{host}:{port}:{database}'
+        return f'jdbc:oracle:thin:@//{host}:{port}/{database}'
+    return f'jdbc:sqlserver://{host}:{port};databaseName={database}'
+
+
+def parse_jdbc_url(url: str) -> dict | None:
+    try:
+        text = (url or '').strip()
+        if not text:
+            return None
+        if text.lower().startswith('jdbc:'):
+            text = text[5:]
+
+        m = re.match(r'^sqlserver://([^;/:]+)(?::(\d+))?(.*)$', text, re.I)
+        if m:
+            host, port, props = m.group(1), m.group(2), m.group(3) or ''
+            database = ''
+            for part in props.split(';'):
+                if '=' not in part:
+                    continue
+                key, val = part.split('=', 1)
+                if key.strip().lower() in ('databasename', 'database'):
+                    database = val
+                    break
+            return {
+                'type': 'mssql',
+                'host': host,
+                'port': int(port) if port else 1433,
+                'database': database,
+                'oracle_sid': False,
+            }
+
+        m = re.match(r'^postgresql://([^/:?]+)(?::(\d+))?(?:/([^?]*))?(?:\?.*)?$', text, re.I)
+        if m:
+            return {
+                'type': 'postgresql',
+                'host': m.group(1),
+                'port': int(m.group(2)) if m.group(2) else 5432,
+                'database': m.group(3) or '',
+                'oracle_sid': False,
+            }
+
+        m = re.match(r'^oracle:thin:@//([^/:]+)(?::(\d+))?/([^?]+)$', text, re.I)
+        if m:
+            return {
+                'type': 'oracle',
+                'host': m.group(1),
+                'port': int(m.group(2)) if m.group(2) else 1521,
+                'database': m.group(3),
+                'oracle_sid': False,
+            }
+
+        m = re.match(r'^oracle:thin:@([^/:]+)(?::(\d+))?:([^/?]+)$', text, re.I)
+        if m:
+            return {
+                'type': 'oracle',
+                'host': m.group(1),
+                'port': int(m.group(2)) if m.group(2) else 1521,
+                'database': m.group(3),
+                'oracle_sid': True,
+            }
+
+        m = re.match(r'^oracle:thin:@([^/:]+)(?::(\d+))?/([^?]+)$', text, re.I)
+        if m:
+            return {
+                'type': 'oracle',
+                'host': m.group(1),
+                'port': int(m.group(2)) if m.group(2) else 1521,
+                'database': m.group(3),
+                'oracle_sid': False,
+            }
+    except Exception:
+        return None
+    return None
 
 
 # ── DB 연결 ──────────────────────────────────────────────
@@ -90,10 +234,10 @@ def connect_mssql(cfg):
     driver = '{ODBC Driver 18 for SQL Server}'
     server = f"{cfg['host']},{cfg['port']}"
     conn_str = f"DRIVER={driver};SERVER={server};DATABASE={cfg['database']};TrustServerCertificate=yes;"
-    if cfg.get('user'):
-        conn_str += f"UID={cfg['user']};PWD={cfg['password']};"
-    else:
+    if cfg.get('auth') == 'windows' or not cfg.get('user'):
         conn_str += "Trusted_Connection=yes;"
+    else:
+        conn_str += f"UID={cfg['user']};PWD={cfg['password']};"
     conn = pyodbc.connect(conn_str, timeout=10)
     conn.timeout = 10
     return conn
@@ -110,7 +254,10 @@ def connect_pg(cfg):
 
 def connect_oracle(cfg):
     import oracledb
-    dsn = f"{cfg['host']}:{cfg['port']}/{cfg['database']}"
+    if cfg.get('oracle_sid'):
+        dsn = oracledb.makedsn(cfg['host'], cfg['port'], sid=cfg['database'])
+    else:
+        dsn = f"{cfg['host']}:{cfg['port']}/{cfg['database']}"
     return oracledb.connect(user=cfg['user'], password=cfg['password'], dsn=dsn)
 
 
@@ -285,73 +432,143 @@ def bordered_button(parent, text, command, color, bg='#ffffff', font=('Segoe UI'
     return border, btn
 
 
+def show_copyable_error(parent, title, msg):
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.configure(bg='#f0f2f5')
+    win.geometry('640x320')
+    win.minsize(400, 200)
+
+    text_frame = tk.Frame(win, bg='#f0f2f5')
+    text_frame.pack(fill='both', expand=True, padx=10, pady=(10, 0))
+
+    txt = tk.Text(text_frame, wrap='word', font=('Consolas', 10),
+                  bg='white', fg='#b00020', borderwidth=1, relief='solid')
+    yscroll = ttk.Scrollbar(text_frame, orient='vertical', command=txt.yview)
+    txt.configure(yscrollcommand=yscroll.set)
+    yscroll.pack(side='right', fill='y')
+    txt.pack(side='left', fill='both', expand=True)
+    txt.insert('1.0', msg)
+    txt.config(state='disabled')
+    # Text 위젯은 마우스 드래그로 선택 + Ctrl+C 기본 동작 가능
+
+    btn_frame = tk.Frame(win, bg='#f0f2f5')
+    btn_frame.pack(fill='x', padx=10, pady=10)
+
+    def do_copy():
+        parent.clipboard_clear()
+        parent.clipboard_append(msg)
+        copy_btn.config(text='복사됨!')
+        win.after(1200, lambda: copy_btn.config(text='전체 복사'))
+
+    copy_btn = tk.Button(btn_frame, text='전체 복사', command=do_copy, width=12)
+    copy_btn.pack(side='left')
+    tk.Button(btn_frame, text='닫기', command=win.destroy, width=12).pack(side='right')
+
+    win.transient(parent)
+    win.grab_set()
+    win.focus_set()
+
+
 # ── 설정 창 ──────────────────────────────────────────────
 
 class SettingsDialog:
     def __init__(self, parent, config, on_save):
         self.config = config
         self.on_save = on_save
+        self._current_idx = None
+        self._syncing = False
 
         self.win = tk.Toplevel(parent)
         self.win.title('DB 연결 설정')
-        self.win.geometry('700x520')
+        self.win.geometry('880x560')
         self.win.configure(bg='#f0f2f5')
         self.win.transient(parent)
         self.win.grab_set()
+        try:
+            icon_path = resource_path('icon.ico')
+            if os.path.exists(icon_path):
+                self.win.iconbitmap(icon_path)
+        except Exception:
+            pass
 
         self._build_ui()
 
     def _build_ui(self):
-        list_frame = tk.Frame(self.win, bg='#f0f2f5')
-        list_frame.pack(fill='x', padx=12, pady=(12, 0))
+        body = tk.Frame(self.win, bg='#f0f2f5')
+        body.pack(fill='both', expand=True, padx=12, pady=(12, 0))
 
-        tk.Label(list_frame, text='DB 연결 목록', bg='#f0f2f5',
-                 font=('Segoe UI', 10, 'bold'), fg='#374151').pack(side='left')
+        left = tk.Frame(body, bg='#f0f2f5', width=240)
+        left.pack(side='left', fill='y', padx=(0, 10))
+        left.pack_propagate(False)
 
-        btn_frame = tk.Frame(list_frame, bg='#f0f2f5')
-        btn_frame.pack(side='right')
+        tk.Label(left, text='데이터 소스', bg='#f0f2f5',
+                 font=('Segoe UI', 10, 'bold'), fg='#374151').pack(anchor='w')
+
+        btn_frame = tk.Frame(left, bg='#f0f2f5')
+        btn_frame.pack(fill='x', pady=(6, 6))
         add_border, _ = bordered_button(btn_frame, '+ 추가', self._add_db, '#2563eb', bg='#f0f2f5')
-        add_border.pack(side='left', padx=4)
+        add_border.pack(side='left', padx=(0, 4))
         del_border, _ = bordered_button(btn_frame, '- 삭제', self._remove_db, '#dc2626', bg='#f0f2f5')
-        del_border.pack(side='left')
+        del_border.pack(side='left', padx=(0, 4))
+        copy_border, _ = bordered_button(btn_frame, '복제', self._duplicate_db, '#6b7280', bg='#f0f2f5')
+        copy_border.pack(side='left')
 
-        self.db_listbox = tk.Listbox(self.win, font=('Segoe UI', 10), height=6,
+        self.db_listbox = tk.Listbox(left, font=('Segoe UI', 10),
                                      selectmode='browse', activestyle='none')
-        self.db_listbox.pack(fill='x', padx=12, pady=(6, 0))
+        self.db_listbox.pack(fill='both', expand=True)
         self.db_listbox.bind('<<ListboxSelect>>', self._on_select)
 
         for db in self.config['databases']:
             self.db_listbox.insert('end', db['label'])
 
-        self.edit_frame = tk.LabelFrame(self.win, text='연결 정보', bg='#ffffff',
+        self.edit_frame = tk.LabelFrame(body, text='연결 정보', bg='#ffffff',
                                         font=('Segoe UI', 9), fg='#6b7280',
-                                        padx=12, pady=8)
-        self.edit_frame.pack(fill='both', expand=True, padx=12, pady=(8, 0))
+                                        padx=14, pady=12)
+        self.edit_frame.pack(side='left', fill='both', expand=True)
 
-        fields = [
-            ('label', '표시명'),
-            ('type', '타입 (mssql / pg / oracle)'),
-            ('host', '호스트'),
-            ('port', '포트'),
-            ('database', '데이터베이스'),
-            ('user', '사용자 (빈값=Windows인증)'),
-            ('password', '비밀번호'),
-        ]
-        self.field_vars = {}
-        for key, lbl in fields:
-            row = tk.Frame(self.edit_frame, bg='#ffffff')
-            row.pack(fill='x', pady=2)
-            tk.Label(row, text=lbl, bg='#ffffff', font=('Segoe UI', 9),
-                     fg='#374151', width=26, anchor='w').pack(side='left')
-            var = tk.StringVar()
-            show = '*' if key == 'password' else ''
-            entry = tk.Entry(row, textvariable=var, font=('Segoe UI', 9),
-                             width=40, show=show)
-            entry.pack(side='left', fill='x', expand=True)
-            self.field_vars[key] = var
+        self.field_vars = {
+            'label': tk.StringVar(),
+            'comment': tk.StringVar(),
+            'type': tk.StringVar(),
+            'host': tk.StringVar(),
+            'port': tk.StringVar(),
+            'database': tk.StringVar(),
+            'oracle_sid': tk.StringVar(),
+            'auth': tk.StringVar(),
+            'user': tk.StringVar(),
+            'password': tk.StringVar(),
+            'url': tk.StringVar(),
+        }
+        self.driver_labels = {'mssql': 'MSSQL', 'postgresql': 'PostgreSQL', 'oracle': 'Oracle'}
+        self.driver_values = {'MSSQL': 'mssql', 'PostgreSQL': 'postgresql', 'Oracle': 'oracle'}
+        self.auth_labels = {'userpass': '사용자 및 비밀번호', 'windows': 'Windows 인증'}
+        self.auth_values = {'사용자 및 비밀번호': 'userpass', 'Windows 인증': 'windows'}
+
+        self._entry_row('label', '이름')
+        self._entry_row('comment', '주석')
+        self._combo_row('type', '드라이버', ['MSSQL', 'PostgreSQL', 'Oracle'], self._on_type_changed)
+        self._host_port_row()
+        self.database_label = self._entry_row('database', '데이터베이스')
+        self.oracle_type_row = self._combo_row('oracle_sid', '연결 타입', ['Service Name', 'SID'], self._on_oracle_type_changed)
+        self.auth_row = self._combo_row('auth', '인증', ['사용자 및 비밀번호', 'Windows 인증'], self._on_auth_changed)
+        self.user_entry = self._entry_row('user', '사용자', return_entry=True)
+        self.password_entry = self._entry_row('password', '비밀번호', show='*', return_entry=True)
+        self._url_row()
+
+        for key in ('host', 'port', 'database'):
+            self.field_vars[key].trace_add('write', self._on_field_changed)
+        self.field_vars['url'].trace_add('write', self._on_url_changed)
 
         bottom = tk.Frame(self.win, bg='#f0f2f5')
         bottom.pack(fill='x', padx=12, pady=12)
+
+        test_border, self.test_btn = bordered_button(bottom, '연결 테스트', self._test_connection,
+                                                     '#2563eb', bg='#f0f2f5', font=('Segoe UI', 10))
+        test_border.pack(side='left', padx=(0, 8))
+        self.test_status = tk.Label(bottom, text='', bg='#f0f2f5',
+                                    font=('Segoe UI', 9), fg='#6b7280', anchor='w')
+        self.test_status.pack(side='left', fill='x', expand=True)
 
         save_border, _ = bordered_button(bottom, '저장', self._save, '#2563eb', bg='#f0f2f5',
                                          font=('Segoe UI', 10), bold=True)
@@ -364,6 +581,48 @@ class SettingsDialog:
             self.db_listbox.selection_set(0)
             self._load_fields(0)
 
+    def _entry_row(self, key, label, show='', return_entry=False):
+        row = tk.Frame(self.edit_frame, bg='#ffffff')
+        row.pack(fill='x', pady=4)
+        lbl = tk.Label(row, text=label, bg='#ffffff', font=('Segoe UI', 9),
+                       fg='#374151', width=18, anchor='w')
+        lbl.pack(side='left')
+        entry = tk.Entry(row, textvariable=self.field_vars[key], font=('Segoe UI', 9), show=show)
+        entry.pack(side='left', fill='x', expand=True)
+        return entry if return_entry else lbl
+
+    def _combo_row(self, key, label, values, command):
+        row = tk.Frame(self.edit_frame, bg='#ffffff')
+        row.pack(fill='x', pady=4)
+        tk.Label(row, text=label, bg='#ffffff', font=('Segoe UI', 9),
+                 fg='#374151', width=18, anchor='w').pack(side='left')
+        combo = ttk.Combobox(row, textvariable=self.field_vars[key], state='readonly',
+                             values=values, font=('Segoe UI', 9))
+        combo.pack(side='left', fill='x', expand=True)
+        combo.bind('<<ComboboxSelected>>', command)
+        setattr(self, f'{key}_combo', combo)
+        return row
+
+    def _host_port_row(self):
+        row = tk.Frame(self.edit_frame, bg='#ffffff')
+        row.pack(fill='x', pady=4)
+        tk.Label(row, text='호스트', bg='#ffffff', font=('Segoe UI', 9),
+                 fg='#374151', width=18, anchor='w').pack(side='left')
+        tk.Entry(row, textvariable=self.field_vars['host'], font=('Segoe UI', 9)).pack(side='left', fill='x', expand=True)
+        tk.Label(row, text='포트', bg='#ffffff', font=('Segoe UI', 9),
+                 fg='#374151', padx=8).pack(side='left')
+        tk.Entry(row, textvariable=self.field_vars['port'], font=('Segoe UI', 9), width=8).pack(side='left')
+
+    def _url_row(self):
+        row = tk.Frame(self.edit_frame, bg='#ffffff')
+        row.pack(fill='x', pady=(12, 2))
+        tk.Label(row, text='URL', bg='#ffffff', font=('Segoe UI', 9),
+                 fg='#374151', width=18, anchor='w').pack(side='left')
+        self.url_entry = tk.Entry(row, textvariable=self.field_vars['url'], font=('Segoe UI', 9))
+        self.url_entry.pack(side='left', fill='x', expand=True)
+        tk.Label(self.edit_frame, text='URL을 수정하면 위 필드에 반영됩니다',
+                 bg='#ffffff', font=('Segoe UI', 8), fg='#6b7280').pack(anchor='w', padx=(126, 0))
+
     def _on_select(self, event):
         sel = self.db_listbox.curselection()
         if sel:
@@ -373,37 +632,83 @@ class SettingsDialog:
     def _load_fields(self, idx):
         self._current_idx = idx
         db = self.config['databases'][idx]
-        for key, var in self.field_vars.items():
-            var.set(str(db.get(key, '')))
+        self._syncing = True
+        self.field_vars['label'].set(str(db.get('label', '')))
+        self.field_vars['comment'].set(str(db.get('comment', '')))
+        self.field_vars['type'].set(self.driver_labels.get(db.get('type', 'mssql'), 'MSSQL'))
+        self.field_vars['host'].set(str(db.get('host', '')))
+        self.field_vars['port'].set(str(db.get('port', '')))
+        self.field_vars['database'].set(str(db.get('database', '')))
+        self.field_vars['oracle_sid'].set('SID' if db.get('oracle_sid') else 'Service Name')
+        self.field_vars['auth'].set(self.auth_labels.get(db.get('auth', 'userpass'), '사용자 및 비밀번호'))
+        self.field_vars['user'].set(str(db.get('user', '')))
+        self.field_vars['password'].set(str(db.get('password', '')))
+        self.field_vars['url'].set(build_jdbc_url(db))
+        self._syncing = False
+        self._update_dynamic_fields()
 
     def _save_current_fields(self):
-        if not hasattr(self, '_current_idx'):
+        if self._current_idx is None:
             return
         idx = self._current_idx
         if idx >= len(self.config['databases']):
             return
         db = self.config['databases'][idx]
-        for key, var in self.field_vars.items():
-            val = var.get().strip()
-            if key == 'port':
-                try:
-                    val = int(val)
-                except ValueError:
-                    val = 0
-            db[key] = val
+        db.update(self._fields_to_db())
         self.db_listbox.delete(idx)
         self.db_listbox.insert(idx, db['label'])
+
+    def _fields_to_db(self):
+        db_type = self.driver_values.get(self.field_vars['type'].get(), 'mssql')
+        try:
+            port = int(self.field_vars['port'].get().strip())
+        except ValueError:
+            port = 0
+        auth = self.auth_values.get(self.field_vars['auth'].get(), 'userpass')
+        if db_type != 'mssql':
+            auth = 'userpass'
+        return {
+            'label': self.field_vars['label'].get().strip(),
+            'comment': self.field_vars['comment'].get().strip(),
+            'type': db_type,
+            'host': self.field_vars['host'].get().strip(),
+            'port': port,
+            'database': self.field_vars['database'].get().strip(),
+            'auth': auth,
+            'user': self.field_vars['user'].get().strip(),
+            'password': self.field_vars['password'].get(),
+            'oracle_sid': self.field_vars['oracle_sid'].get() == 'SID',
+        }
 
     def _add_db(self):
         new_db = {
             'label': '[MSSQL] NewDB',
+            'comment': '',
             'type': 'mssql',
             'host': 'localhost',
             'port': 1433,
             'database': '',
+            'auth': 'windows',
             'user': '',
             'password': '',
+            'oracle_sid': False,
         }
+        self._save_current_fields()
+        self.config['databases'].append(new_db)
+        self.db_listbox.insert('end', new_db['label'])
+        self.db_listbox.selection_clear(0, 'end')
+        self.db_listbox.selection_set('end')
+        self._load_fields(len(self.config['databases']) - 1)
+
+    def _duplicate_db(self):
+        import copy
+        sel = self.db_listbox.curselection()
+        if not sel:
+            return
+        self._save_current_fields()
+        idx = sel[0]
+        new_db = copy.deepcopy(self.config['databases'][idx])
+        new_db['label'] = f"{new_db.get('label', '')} 복사본"
         self.config['databases'].append(new_db)
         self.db_listbox.insert('end', new_db['label'])
         self.db_listbox.selection_clear(0, 'end')
@@ -421,6 +726,118 @@ class SettingsDialog:
             new_idx = min(idx, len(self.config['databases']) - 1)
             self.db_listbox.selection_set(new_idx)
             self._load_fields(new_idx)
+        else:
+            self._current_idx = None
+
+    def _on_type_changed(self, event=None):
+        old_port = self.field_vars['port'].get().strip()
+        db_type = self.driver_values.get(self.field_vars['type'].get(), 'mssql')
+        if old_port == '' or old_port in ('1433', '5432', '1521'):
+            self.field_vars['port'].set(str(DEFAULT_PORTS[db_type]))
+        self._update_dynamic_fields()
+        self._update_url_from_fields()
+
+    def _on_oracle_type_changed(self, event=None):
+        self._update_dynamic_fields()
+        self._update_url_from_fields()
+
+    def _on_auth_changed(self, event=None):
+        self._update_dynamic_fields()
+
+    def _on_field_changed(self, *args):
+        self._update_url_from_fields()
+
+    def _on_url_changed(self, *args):
+        if self._syncing:
+            return
+        parsed = parse_jdbc_url(self.field_vars['url'].get())
+        if not parsed:
+            self.url_entry.config(bg='#fdecea')
+            return
+        self._syncing = True
+        self.field_vars['type'].set(self.driver_labels.get(parsed['type'], 'MSSQL'))
+        self.field_vars['host'].set(parsed['host'])
+        self.field_vars['port'].set(str(parsed['port']))
+        self.field_vars['database'].set(parsed['database'])
+        self.field_vars['oracle_sid'].set('SID' if parsed['oracle_sid'] else 'Service Name')
+        self._syncing = False
+        self.url_entry.config(bg='white')
+        self._update_dynamic_fields()
+
+    def _update_url_from_fields(self):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.field_vars['url'].set(build_jdbc_url(self._fields_to_db()))
+        self.url_entry.config(bg='white')
+        self._syncing = False
+
+    def _update_dynamic_fields(self):
+        db_type = self.driver_values.get(self.field_vars['type'].get(), 'mssql')
+        is_oracle = db_type == 'oracle'
+        self.oracle_type_row.pack_forget()
+        if is_oracle:
+            self.oracle_type_row.pack(fill='x', pady=4, after=self.database_label.master)
+            self.database_label.config(text='SID' if self.field_vars['oracle_sid'].get() == 'SID' else '서비스')
+        else:
+            self.database_label.config(text='데이터베이스')
+
+        auth_values = ['사용자 및 비밀번호', 'Windows 인증'] if db_type == 'mssql' else ['사용자 및 비밀번호']
+        self.auth_combo['values'] = auth_values
+        if self.field_vars['auth'].get() not in auth_values:
+            self.field_vars['auth'].set('사용자 및 비밀번호')
+        state = 'disabled' if db_type == 'mssql' and self.field_vars['auth'].get() == 'Windows 인증' else 'normal'
+        self.user_entry.config(state=state)
+        self.password_entry.config(state=state)
+
+    def _test_connection(self):
+        cfg = self._fields_to_db()
+        self.test_btn.config(state='disabled')
+        self.test_status.config(text='테스트 중...', fg='#6b7280')
+
+        def worker():
+            conn = None
+            try:
+                if cfg['type'] == 'mssql':
+                    conn = connect_mssql(cfg)
+                    version_sql = 'SELECT @@VERSION'
+                elif cfg['type'] == 'oracle':
+                    conn = connect_oracle(cfg)
+                    version_sql = 'SELECT banner FROM v$version WHERE ROWNUM=1'
+                else:
+                    conn = connect_pg(cfg)
+                    version_sql = 'SELECT version()'
+                version = ''
+                try:
+                    cur = conn.cursor()
+                    cur.execute(version_sql)
+                    row = cur.fetchone()
+                    if row:
+                        version = str(row[0]).splitlines()[0][:60]
+                except Exception:
+                    version = ''
+                finally:
+                    conn.close()
+                self.win.after(0, self._test_success, version)
+            except Exception as e:
+                try:
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
+                self.win.after(0, self._test_failed, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _test_success(self, version):
+        self.test_btn.config(state='normal')
+        msg = f'성공: {version}' if version else '연결 성공'
+        self.test_status.config(text=msg, fg='#15803d')
+
+    def _test_failed(self, msg):
+        self.test_btn.config(state='normal')
+        self.test_status.config(text='연결 실패', fg='#dc2626')
+        show_copyable_error(self.win, '연결 실패', msg)
 
     def _save(self):
         self._save_current_fields()
@@ -445,9 +862,12 @@ class DBSearchApp:
         self._current_db_type = 'mssql'
         self._current_search_value = ''
 
-        icon_path = os.path.join(BASE_DIR, 'icon.ico')
-        if os.path.exists(icon_path):
-            self.root.iconbitmap(icon_path)
+        try:
+            icon_path = resource_path('icon.ico')
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except Exception:
+            pass
 
         self._build_ui()
 
@@ -629,41 +1049,7 @@ class DBSearchApp:
         self.root.after(0, self._show_copyable_error, '검색 오류', msg)
 
     def _show_copyable_error(self, title, msg):
-        win = tk.Toplevel(self.root)
-        win.title(title)
-        win.configure(bg='#f0f2f5')
-        win.geometry('640x320')
-        win.minsize(400, 200)
-
-        text_frame = tk.Frame(win, bg='#f0f2f5')
-        text_frame.pack(fill='both', expand=True, padx=10, pady=(10, 0))
-
-        txt = tk.Text(text_frame, wrap='word', font=('Consolas', 10),
-                      bg='white', fg='#b00020', borderwidth=1, relief='solid')
-        yscroll = ttk.Scrollbar(text_frame, orient='vertical', command=txt.yview)
-        txt.configure(yscrollcommand=yscroll.set)
-        yscroll.pack(side='right', fill='y')
-        txt.pack(side='left', fill='both', expand=True)
-        txt.insert('1.0', msg)
-        txt.config(state='disabled')
-        # Text 위젯은 마우스 드래그로 선택 + Ctrl+C 기본 동작 가능
-
-        btn_frame = tk.Frame(win, bg='#f0f2f5')
-        btn_frame.pack(fill='x', padx=10, pady=10)
-
-        def do_copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(msg)
-            copy_btn.config(text='복사됨!')
-            win.after(1200, lambda: copy_btn.config(text='전체 복사'))
-
-        copy_btn = tk.Button(btn_frame, text='전체 복사', command=do_copy, width=12)
-        copy_btn.pack(side='left')
-        tk.Button(btn_frame, text='닫기', command=win.destroy, width=12).pack(side='right')
-
-        win.transient(self.root)
-        win.grab_set()
-        win.focus_set()
+        show_copyable_error(self.root, title, msg)
 
     def _finish(self, msg):
         self.searching = False

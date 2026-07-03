@@ -3,3 +3,7 @@ config.dat
 config.json
 __pycache__/
 *.pyc
+build/
+dist/
+DBSearch.spec
+DBSearch.exe
