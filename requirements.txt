@@ -1,3 +1,4 @@
 pyodbc
 psycopg2-binary
+oracledb
 cryptography

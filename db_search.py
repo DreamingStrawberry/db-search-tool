@@ -6,7 +6,7 @@ import os
 import time
 from cryptography.fernet import Fernet
 
-VERSION = '2026.03.06.002'
+VERSION = '1.0.0'
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.path.join(BASE_DIR, '.secret.key')
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.dat')
@@ -108,6 +108,12 @@ def connect_pg(cfg):
     )
 
 
+def connect_oracle(cfg):
+    import oracledb
+    dsn = f"{cfg['host']}:{cfg['port']}/{cfg['database']}"
+    return oracledb.connect(user=cfg['user'], password=cfg['password'], dsn=dsn)
+
+
 # ── 검색 로직 ──────────────────────────────────────────────
 
 def escape_sql(value):
@@ -149,6 +155,64 @@ def search_mssql(cfg, search_value, on_progress, on_found, on_done, on_error, st
             """
             try:
                 cursor.execute(sql, f'%{search_value}%')
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    on_found(schema, table, column, count)
+            except Exception:
+                pass
+
+        conn.close()
+        elapsed = time.time() - start_time
+        on_done(elapsed=elapsed)
+    except Exception as e:
+        on_error(str(e))
+
+
+def search_oracle(cfg, search_value, on_progress, on_found, on_done, on_error, stop_flag):
+    try:
+        conn = connect_oracle(cfg)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT OWNER, TABLE_NAME, COLUMN_NAME
+            FROM ALL_TAB_COLUMNS
+            WHERE DATA_TYPE IN (
+                'CHAR','VARCHAR2','NCHAR','NVARCHAR2','CLOB','NCLOB',
+                'NUMBER','FLOAT','BINARY_FLOAT','BINARY_DOUBLE','INTEGER',
+                'DATE','TIMESTAMP(6)','TIMESTAMP(0)','TIMESTAMP'
+            )
+            AND OWNER NOT IN (
+                'SYS','SYSTEM','XDB','MDSYS','CTXSYS','OUTLN','APPQOSSYS',
+                'DBSNMP','GSMADMIN_INTERNAL','OJVMSYS','OLAPSYS','ORDDATA',
+                'ORDPLUGINS','ORDSYS','SI_INFORMTN_SCHEMA','WMSYS','LBACSYS',
+                'AUDSYS','REMOTE_SCHEDULER_AGENT','GSMUSER','GSMCATUSER',
+                'SYSBACKUP','SYSDG','SYSKM','SYSRAC','XS$NULL','DIP',
+                'ANONYMOUS','ORACLE_OCM','PUBLIC','FLOWS_FILES',
+                'APEX_PUBLIC_USER','APEX_REST_PUBLIC_USER','APEX_LISTENER',
+                'HR','SCOTT','PDBADMIN','DVF','DVSYS','GGSYS','MDDATA',
+                'CTXAPP','EXFSYS','OWBSYS'
+            )
+            AND OWNER NOT LIKE 'APEX_%'
+            AND OWNER NOT LIKE 'GG_%'
+            ORDER BY OWNER, TABLE_NAME, COLUMN_NAME
+        """)
+        columns = cursor.fetchall()
+        total = len(columns)
+        start_time = time.time()
+        pattern = f'%{search_value}%'
+
+        for i, (schema, table, column) in enumerate(columns):
+            if stop_flag():
+                on_done(cancelled=True)
+                conn.close()
+                return
+
+            elapsed = time.time() - start_time
+            eta = (elapsed / (i + 1)) * (total - i - 1) if i > 0 else 0
+            on_progress(i + 1, total, f'{schema}.{table}.{column}', elapsed, eta)
+
+            sql = f'SELECT COUNT(*) FROM "{schema}"."{table}" WHERE TO_CHAR("{column}") LIKE :q'
+            try:
+                cursor.execute(sql, q=pattern)
                 count = cursor.fetchone()[0]
                 if count > 0:
                     on_found(schema, table, column, count)
@@ -266,7 +330,7 @@ class SettingsDialog:
 
         fields = [
             ('label', '표시명'),
-            ('type', '타입 (mssql / postgresql)'),
+            ('type', '타입 (mssql / pg / oracle)'),
             ('host', '호스트'),
             ('port', '포트'),
             ('database', '데이터베이스'),
@@ -514,7 +578,12 @@ class DBSearchApp:
         self.search_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
 
-        search_fn = search_mssql if cfg['type'] == 'mssql' else search_pg
+        if cfg['type'] == 'mssql':
+            search_fn = search_mssql
+        elif cfg['type'] == 'oracle':
+            search_fn = search_oracle
+        else:
+            search_fn = search_pg
         t = threading.Thread(target=search_fn, args=(
             cfg, search_value,
             self._on_progress, self._on_found, self._on_done, self._on_error,
@@ -557,6 +626,44 @@ class DBSearchApp:
 
     def _on_error(self, msg):
         self.root.after(0, self._finish, f'오류: {msg}')
+        self.root.after(0, self._show_copyable_error, '검색 오류', msg)
+
+    def _show_copyable_error(self, title, msg):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg='#f0f2f5')
+        win.geometry('640x320')
+        win.minsize(400, 200)
+
+        text_frame = tk.Frame(win, bg='#f0f2f5')
+        text_frame.pack(fill='both', expand=True, padx=10, pady=(10, 0))
+
+        txt = tk.Text(text_frame, wrap='word', font=('Consolas', 10),
+                      bg='white', fg='#b00020', borderwidth=1, relief='solid')
+        yscroll = ttk.Scrollbar(text_frame, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=yscroll.set)
+        yscroll.pack(side='right', fill='y')
+        txt.pack(side='left', fill='both', expand=True)
+        txt.insert('1.0', msg)
+        txt.config(state='disabled')
+        # Text 위젯은 마우스 드래그로 선택 + Ctrl+C 기본 동작 가능
+
+        btn_frame = tk.Frame(win, bg='#f0f2f5')
+        btn_frame.pack(fill='x', padx=10, pady=10)
+
+        def do_copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(msg)
+            copy_btn.config(text='복사됨!')
+            win.after(1200, lambda: copy_btn.config(text='전체 복사'))
+
+        copy_btn = tk.Button(btn_frame, text='전체 복사', command=do_copy, width=12)
+        copy_btn.pack(side='left')
+        tk.Button(btn_frame, text='닫기', command=win.destroy, width=12).pack(side='right')
+
+        win.transient(self.root)
+        win.grab_set()
+        win.focus_set()
 
     def _finish(self, msg):
         self.searching = False
@@ -581,6 +688,8 @@ class DBSearchApp:
         sv = self._current_search_value
         if self._current_db_type == 'mssql':
             return f"SELECT * FROM [{schema}].[{table}] WHERE [{column}] LIKE N'%{sv}%'"
+        elif self._current_db_type == 'oracle':
+            return f"""SELECT * FROM "{schema}"."{table}" WHERE TO_CHAR("{column}") LIKE '%{sv}%'"""
         else:
             return f"""SELECT * FROM "{schema}"."{table}" WHERE "{column}"::text LIKE '%{sv}%'"""
 
@@ -622,6 +731,8 @@ class DBSearchApp:
         menu.add_separator()
         if self._current_db_type == 'mssql':
             count_q = f"SELECT COUNT(*) FROM [{schema}].[{table}] WHERE [{column}] LIKE N'%{sv}%'"
+        elif self._current_db_type == 'oracle':
+            count_q = f"""SELECT COUNT(*) FROM "{schema}"."{table}" WHERE TO_CHAR("{column}") LIKE '%{sv}%'"""
         else:
             count_q = f"""SELECT COUNT(*) FROM "{schema}"."{table}" WHERE "{column}"::text LIKE '%{sv}%'"""
         menu.add_command(label='COUNT 쿼리 복사', command=lambda: self._copy_to_clipboard(count_q))
