@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
 import json
 import os
@@ -8,7 +8,7 @@ import sys
 import time
 from cryptography.fernet import Fernet
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -158,6 +158,7 @@ DEFAULT_PORTS = {
     'mssql': 1433,
     'postgresql': 5432,
     'oracle': 1521,
+    'mysql': 3306,
 }
 
 
@@ -166,6 +167,10 @@ def build_jdbc_url(db: dict) -> str:
     host = db.get('host', '')
     port = db.get('port') or DEFAULT_PORTS.get(db_type, 0)
     database = db.get('database', '')
+    if db_type == 'mysql':
+        return f'jdbc:mysql://{host}:{port}/{database}'
+    if db_type == 'sqlite':
+        return f'jdbc:sqlite:{database}'
     if db_type == 'postgresql':
         return f'jdbc:postgresql://{host}:{port}/{database}'
     if db_type == 'oracle':
@@ -183,6 +188,16 @@ def parse_jdbc_url(url: str) -> dict | None:
         if text.lower().startswith('jdbc:'):
             text = text[5:]
 
+        m = re.match(r'^sqlite:(.+)$', text, re.I)
+        if m:
+            return {
+                'type': 'sqlite',
+                'host': '',
+                'port': 0,
+                'database': m.group(1),
+                'oracle_sid': False,
+            }
+
         m = re.match(r'^sqlserver://([^;/:]+)(?::(\d+))?(.*)$', text, re.I)
         if m:
             host, port, props = m.group(1), m.group(2), m.group(3) or ''
@@ -199,6 +214,16 @@ def parse_jdbc_url(url: str) -> dict | None:
                 'host': host,
                 'port': int(port) if port else 1433,
                 'database': database,
+                'oracle_sid': False,
+            }
+
+        m = re.match(r'^mysql://([^/:?]+)(?::(\d+))?(?:/([^?]*))?(?:\?.*)?$', text, re.I)
+        if m:
+            return {
+                'type': 'mysql',
+                'host': m.group(1),
+                'port': int(m.group(2)) if m.group(2) else 3306,
+                'database': m.group(3) or '',
                 'oracle_sid': False,
             }
 
@@ -249,17 +274,32 @@ def parse_jdbc_url(url: str) -> dict | None:
 # ── DB 연결 ──────────────────────────────────────────────
 
 def connect_mssql(cfg):
-    import pyodbc
-    driver = '{ODBC Driver 18 for SQL Server}'
+    use_windows = cfg.get('auth') == 'windows' or not cfg.get('user')
     server = f"{cfg['host']},{cfg['port']}"
-    conn_str = f"DRIVER={driver};SERVER={server};DATABASE={cfg['database']};TrustServerCertificate=yes;"
-    if cfg.get('auth') == 'windows' or not cfg.get('user'):
-        conn_str += "Trusted_Connection=yes;"
-    else:
-        conn_str += f"UID={cfg['user']};PWD={cfg['password']};"
-    conn = pyodbc.connect(conn_str, timeout=10)
-    conn.timeout = 10
-    return conn
+    # 1) pyodbc 우선 (ODBC Driver 설치돼 있으면 Windows 인증까지)
+    try:
+        import pyodbc
+        driver = '{ODBC Driver 18 for SQL Server}'
+        conn_str = f"DRIVER={driver};SERVER={server};DATABASE={cfg['database']};TrustServerCertificate=yes;"
+        if use_windows:
+            conn_str += "Trusted_Connection=yes;"
+        else:
+            conn_str += f"UID={cfg['user']};PWD={cfg['password']};"
+        conn = pyodbc.connect(conn_str, timeout=10)
+        conn.timeout = 10
+        return conn
+    except Exception as e_odbc:
+        # 2) pytds 폴백 (순수파이썬 내장, SQL 인증만)
+        if use_windows:
+            raise Exception('MSSQL Windows 통합인증은 ODBC Driver 18 설치가 필요합니다. '
+                            'SQL 계정 인증으로 바꾸면 드라이버 없이 접속됩니다.\n(ODBC: %s)' % e_odbc)
+        try:
+            import pytds
+        except ImportError:
+            raise e_odbc
+        return pytds.connect(server=cfg['host'], port=int(cfg['port']),
+                             database=cfg['database'], user=cfg['user'], password=cfg['password'],
+                             login_timeout=10, timeout=30, autocommit=True)
 
 
 def connect_pg(cfg):
@@ -278,6 +318,18 @@ def connect_oracle(cfg):
     else:
         dsn = f"{cfg['host']}:{cfg['port']}/{cfg['database']}"
     return oracledb.connect(user=cfg['user'], password=cfg['password'], dsn=dsn)
+
+
+def connect_mysql(cfg):
+    import pymysql
+    return pymysql.connect(host=cfg['host'], port=int(cfg['port']),
+                           user=cfg['user'], password=cfg['password'],
+                           database=cfg['database'], connect_timeout=10, charset='utf8mb4')
+
+
+def connect_sqlite(cfg):
+    import sqlite3
+    return sqlite3.connect(cfg['database'])
 
 
 # ── 검색 로직 ──────────────────────────────────────────────
@@ -304,6 +356,7 @@ def search_mssql(cfg, search_value, on_progress, on_found, on_done, on_error, st
         columns = cursor.fetchall()
         total = len(columns)
         start_time = time.time()
+        safe = escape_sql(search_value)
 
         for i, (schema, table, column) in enumerate(columns):
             if stop_flag():
@@ -315,13 +368,93 @@ def search_mssql(cfg, search_value, on_progress, on_found, on_done, on_error, st
             eta = (elapsed / (i + 1)) * (total - i - 1) if i > 0 else 0
             on_progress(i + 1, total, f'{schema}.{table}.{column}', elapsed, eta)
 
-            sql = f"""
-                SELECT COUNT(*) FROM [{schema}].[{table}]
-                WHERE CAST([{column}] AS NVARCHAR(MAX)) LIKE ?
-            """
+            sql = f"SELECT COUNT(*) FROM [{schema}].[{table}] WHERE CAST([{column}] AS NVARCHAR(MAX)) LIKE N'%{safe}%'"
             try:
-                cursor.execute(sql, f'%{search_value}%')
+                cursor.execute(sql)
                 count = cursor.fetchone()[0]
+                if count > 0:
+                    on_found(schema, table, column, count)
+            except Exception:
+                pass
+
+        conn.close()
+        elapsed = time.time() - start_time
+        on_done(elapsed=elapsed)
+    except Exception as e:
+        on_error(str(e))
+
+
+def search_mysql(cfg, search_value, on_progress, on_found, on_done, on_error, stop_flag):
+    try:
+        conn = connect_mysql(cfg)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT table_schema, table_name, column_name FROM information_schema.columns
+            WHERE table_schema = %s
+              AND data_type IN ('char','varchar','tinytext','text','mediumtext','longtext',
+                                'int','bigint','smallint','mediumint','tinyint','decimal','numeric','float','double',
+                                'date','datetime','timestamp','year')
+            ORDER BY table_schema, table_name, column_name
+        """, (cfg['database'],))
+        columns = cursor.fetchall()
+        total = len(columns)
+        start_time = time.time()
+        safe = escape_sql(search_value)
+
+        for i, (schema, table, column) in enumerate(columns):
+            if stop_flag():
+                on_done(cancelled=True)
+                conn.close()
+                return
+
+            elapsed = time.time() - start_time
+            eta = (elapsed / (i + 1)) * (total - i - 1) if i > 0 else 0
+            on_progress(i + 1, total, f'{schema}.{table}.{column}', elapsed, eta)
+
+            sql = f"SELECT COUNT(*) FROM `{schema}`.`{table}` WHERE CAST(`{column}` AS CHAR) LIKE '%{safe}%'"
+            try:
+                cursor.execute(sql)
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    on_found(schema, table, column, count)
+            except Exception:
+                pass
+
+        conn.close()
+        elapsed = time.time() - start_time
+        on_done(elapsed=elapsed)
+    except Exception as e:
+        on_error(str(e))
+
+
+def search_sqlite(cfg, search_value, on_progress, on_found, on_done, on_error, stop_flag):
+    try:
+        conn = connect_sqlite(cfg)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        tables = [r[0] for r in cur.fetchall()]
+        columns = []
+        for t in tables:
+            cur.execute(f'PRAGMA table_info("{t}")')
+            for row in cur.fetchall():
+                columns.append(('main', t, row[1]))
+        total = len(columns)
+        start_time = time.time()
+
+        for i, (schema, table, column) in enumerate(columns):
+            if stop_flag():
+                on_done(cancelled=True)
+                conn.close()
+                return
+
+            elapsed = time.time() - start_time
+            eta = (elapsed / (i + 1)) * (total - i - 1) if i > 0 else 0
+            on_progress(i + 1, total, f'{schema}.{table}.{column}', elapsed, eta)
+
+            sql = f'SELECT COUNT(*) FROM "{table}" WHERE CAST("{column}" AS TEXT) LIKE ?'
+            try:
+                cur.execute(sql, (f'%{search_value}%',))
+                count = cur.fetchone()[0]
                 if count > 0:
                     on_found(schema, table, column, count)
             except Exception:
@@ -559,16 +692,22 @@ class SettingsDialog:
             'password': tk.StringVar(),
             'url': tk.StringVar(),
         }
-        self.driver_labels = {'mssql': 'MSSQL', 'postgresql': 'PostgreSQL', 'oracle': 'Oracle'}
-        self.driver_values = {'MSSQL': 'mssql', 'PostgreSQL': 'postgresql', 'Oracle': 'oracle'}
+        self.driver_labels = {'mssql': 'MSSQL', 'postgresql': 'PostgreSQL', 'oracle': 'Oracle',
+                              'mysql': 'MySQL / MariaDB', 'sqlite': 'SQLite'}
+        self.driver_values = {'MSSQL': 'mssql', 'PostgreSQL': 'postgresql', 'Oracle': 'oracle',
+                              'MySQL / MariaDB': 'mysql', 'SQLite': 'sqlite'}
         self.auth_labels = {'userpass': '사용자 및 비밀번호', 'windows': 'Windows 인증'}
         self.auth_values = {'사용자 및 비밀번호': 'userpass', 'Windows 인증': 'windows'}
 
-        self._entry_row('label', '이름')
-        self._entry_row('comment', '주석')
-        self._combo_row('type', '드라이버', ['MSSQL', 'PostgreSQL', 'Oracle'], self._on_type_changed)
+        self.label_label = self._entry_row('label', '이름')
+        self.comment_label = self._entry_row('comment', '주석')
+        self.type_row = self._combo_row('type', '드라이버',
+                                        ['MSSQL', 'PostgreSQL', 'Oracle', 'MySQL / MariaDB', 'SQLite'],
+                                        self._on_type_changed)
         self._host_port_row()
         self.database_label = self._entry_row('database', '데이터베이스')
+        self.sqlite_browse_border, _ = bordered_button(self.database_label.master, '찾기', self._browse_sqlite,
+                                                       '#6b7280', bg='#ffffff')
         self.oracle_type_row = self._combo_row('oracle_sid', '연결 타입', ['Service Name', 'SID'], self._on_oracle_type_changed)
         self.auth_row = self._combo_row('auth', '인증', ['사용자 및 비밀번호', 'Windows 인증'], self._on_auth_changed)
         self.user_entry = self._entry_row('user', '사용자', return_entry=True)
@@ -624,6 +763,7 @@ class SettingsDialog:
 
     def _host_port_row(self):
         row = tk.Frame(self.edit_frame, bg='#ffffff')
+        self.hostport_row = row
         row.pack(fill='x', pady=4)
         tk.Label(row, text='호스트', bg='#ffffff', font=('Segoe UI', 9),
                  fg='#374151', width=18, anchor='w').pack(side='left')
@@ -634,6 +774,7 @@ class SettingsDialog:
 
     def _url_row(self):
         row = tk.Frame(self.edit_frame, bg='#ffffff')
+        self.url_row = row
         row.pack(fill='x', pady=(12, 2))
         tk.Label(row, text='URL', bg='#ffffff', font=('Segoe UI', 9),
                  fg='#374151', width=18, anchor='w').pack(side='left')
@@ -684,7 +825,7 @@ class SettingsDialog:
         db_type = self.driver_values.get(self.field_vars['type'].get(), 'mssql')
         try:
             port = int(self.field_vars['port'].get().strip())
-        except ValueError:
+        except (TypeError, ValueError):
             port = 0
         auth = self.auth_values.get(self.field_vars['auth'].get(), 'userpass')
         if db_type != 'mssql':
@@ -754,8 +895,8 @@ class SettingsDialog:
     def _on_type_changed(self, event=None):
         old_port = self.field_vars['port'].get().strip()
         db_type = self.driver_values.get(self.field_vars['type'].get(), 'mssql')
-        if old_port == '' or old_port in ('1433', '5432', '1521'):
-            self.field_vars['port'].set(str(DEFAULT_PORTS[db_type]))
+        if old_port == '' or old_port in ('1433', '5432', '1521', '3306'):
+            self.field_vars['port'].set(str(DEFAULT_PORTS.get(db_type, 0)))
         self._update_dynamic_fields()
         self._update_url_from_fields()
 
@@ -794,13 +935,34 @@ class SettingsDialog:
         self.url_entry.config(bg='white')
         self._syncing = False
 
+    def _browse_sqlite(self):
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            filetypes=[('SQLite DB', '*.db *.sqlite *.sqlite3'), ('모든 파일', '*.*')]
+        )
+        if path:
+            self.field_vars['database'].set(path)
+
     def _update_dynamic_fields(self):
         db_type = self.driver_values.get(self.field_vars['type'].get(), 'mssql')
         is_oracle = db_type == 'oracle'
+        is_sqlite = db_type == 'sqlite'
+        self.hostport_row.pack_forget()
         self.oracle_type_row.pack_forget()
+        self.auth_row.pack_forget()
+        self.user_entry.master.pack_forget()
+        self.password_entry.master.pack_forget()
+        self.url_row.pack_forget()
+        self.sqlite_browse_border.pack_forget()
+
+        if not is_sqlite:
+            self.hostport_row.pack(fill='x', pady=4, after=self.type_row)
         if is_oracle:
             self.oracle_type_row.pack(fill='x', pady=4, after=self.database_label.master)
             self.database_label.config(text='SID' if self.field_vars['oracle_sid'].get() == 'SID' else '서비스')
+        elif is_sqlite:
+            self.database_label.config(text='DB 파일 경로')
+            self.sqlite_browse_border.pack(side='left', padx=(6, 0))
         else:
             self.database_label.config(text='데이터베이스')
 
@@ -811,6 +973,14 @@ class SettingsDialog:
         state = 'disabled' if db_type == 'mssql' and self.field_vars['auth'].get() == 'Windows 인증' else 'normal'
         self.user_entry.config(state=state)
         self.password_entry.config(state=state)
+        if not is_sqlite:
+            auth_after = self.oracle_type_row if is_oracle else self.database_label.master
+            self.auth_row.pack(fill='x', pady=4, after=auth_after)
+            self.user_entry.master.pack(fill='x', pady=4, after=self.auth_row)
+            self.password_entry.master.pack(fill='x', pady=4, after=self.user_entry.master)
+            self.url_row.pack(fill='x', pady=(12, 2), after=self.password_entry.master)
+        else:
+            self.url_row.pack(fill='x', pady=(12, 2), after=self.database_label.master)
 
     def _test_connection(self):
         cfg = self._fields_to_db()
@@ -826,6 +996,14 @@ class SettingsDialog:
                 elif cfg['type'] == 'oracle':
                     conn = connect_oracle(cfg)
                     version_sql = 'SELECT banner FROM v$version WHERE ROWNUM=1'
+                elif cfg['type'] == 'mysql':
+                    conn = connect_mysql(cfg)
+                    version_sql = 'SELECT VERSION()'
+                elif cfg['type'] == 'sqlite':
+                    if not os.path.exists(cfg['database']):
+                        raise Exception(f"DB 파일을 찾을 수 없습니다: {cfg['database']}")
+                    conn = connect_sqlite(cfg)
+                    version_sql = 'SELECT sqlite_version()'
                 else:
                     conn = connect_pg(cfg)
                     version_sql = 'SELECT version()'
@@ -1024,6 +1202,10 @@ class DBSearchApp:
             search_fn = search_mssql
         elif cfg['type'] == 'oracle':
             search_fn = search_oracle
+        elif cfg['type'] == 'mysql':
+            search_fn = search_mysql
+        elif cfg['type'] == 'sqlite':
+            search_fn = search_sqlite
         else:
             search_fn = search_pg
         t = threading.Thread(target=search_fn, args=(
@@ -1098,6 +1280,10 @@ class DBSearchApp:
             return f"SELECT * FROM [{schema}].[{table}] WHERE [{column}] LIKE N'%{sv}%'"
         elif self._current_db_type == 'oracle':
             return f"""SELECT * FROM "{schema}"."{table}" WHERE TO_CHAR("{column}") LIKE '%{sv}%'"""
+        elif self._current_db_type == 'mysql':
+            return f"SELECT * FROM `{schema}`.`{table}` WHERE CAST(`{column}` AS CHAR) LIKE '%{sv}%'"
+        elif self._current_db_type == 'sqlite':
+            return f"""SELECT * FROM "{table}" WHERE CAST("{column}" AS TEXT) LIKE '%{sv}%'"""
         else:
             return f"""SELECT * FROM "{schema}"."{table}" WHERE "{column}"::text LIKE '%{sv}%'"""
 
@@ -1141,6 +1327,10 @@ class DBSearchApp:
             count_q = f"SELECT COUNT(*) FROM [{schema}].[{table}] WHERE [{column}] LIKE N'%{sv}%'"
         elif self._current_db_type == 'oracle':
             count_q = f"""SELECT COUNT(*) FROM "{schema}"."{table}" WHERE TO_CHAR("{column}") LIKE '%{sv}%'"""
+        elif self._current_db_type == 'mysql':
+            count_q = f"SELECT COUNT(*) FROM `{schema}`.`{table}` WHERE CAST(`{column}` AS CHAR) LIKE '%{sv}%'"
+        elif self._current_db_type == 'sqlite':
+            count_q = f"""SELECT COUNT(*) FROM "{table}" WHERE CAST("{column}" AS TEXT) LIKE '%{sv}%'"""
         else:
             count_q = f"""SELECT COUNT(*) FROM "{schema}"."{table}" WHERE "{column}"::text LIKE '%{sv}%'"""
         menu.add_command(label='COUNT 쿼리 복사', command=lambda: self._copy_to_clipboard(count_q))

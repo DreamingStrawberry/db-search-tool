@@ -1,4 +1,6 @@
 pyodbc
+python-tds
 psycopg2-binary
 oracledb
+pymysql
 cryptography
