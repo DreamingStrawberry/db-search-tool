@@ -13,9 +13,6 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-KEY_FILE = os.path.join(BASE_DIR, '.secret.key')
-CONFIG_FILE = os.path.join(BASE_DIR, 'config.dat')
-OLD_CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 
 
 def resource_path(name):
@@ -24,6 +21,28 @@ def resource_path(name):
         if os.path.exists(bundled):
             return bundled
     return os.path.join(BASE_DIR, name)
+
+
+def _resolve_config_dir():
+    # 포터블: exe 옆에 portable.txt 또는 config.dat 가 있으면 그 폴더(USB 휴대/기존 폴더 하위호환)
+    portable = os.path.join(BASE_DIR, 'portable.txt')
+    legacy = os.path.join(BASE_DIR, 'config.dat')
+    if os.path.exists(portable) or os.path.exists(legacy):
+        return BASE_DIR
+    # 분리: %APPDATA%\DBSearch (없으면 홈). exe만 배포 시 DB정보를 exe와 분리
+    base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    target = os.path.join(base, 'DBSearch')
+    try:
+        os.makedirs(target, exist_ok=True)
+    except Exception:
+        return BASE_DIR
+    return target
+
+
+CONFIG_DIR = _resolve_config_dir()
+KEY_FILE = os.path.join(CONFIG_DIR, '.secret.key')
+CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.dat')
+OLD_CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 
 
 # ── 암호화 ──────────────────────────────────────────────
@@ -622,6 +641,9 @@ class SettingsDialog:
         self.url_entry.pack(side='left', fill='x', expand=True)
         tk.Label(self.edit_frame, text='URL을 수정하면 위 필드에 반영됩니다',
                  bg='#ffffff', font=('Segoe UI', 8), fg='#6b7280').pack(anchor='w', padx=(126, 0))
+        tk.Label(self.edit_frame, text=f'설정 저장 위치: {CONFIG_FILE}',
+                 bg='#ffffff', font=('Segoe UI', 8), fg='#9ca3af',
+                 anchor='w', justify='left').pack(anchor='w', pady=(10, 0))
 
     def _on_select(self, event):
         sel = self.db_listbox.curselection()
